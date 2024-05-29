@@ -1,0 +1,187 @@
+import openai
+import alpaca_trade_api as tradeapi
+import requests
+import time
+import pandas as pd
+from datetime import datetime, timezone
+import logging
+
+
+# Your API keys
+OPENAI_API_KEY = 'your_openai_api_key'
+ALPACA_API_KEY = 'your_alpaca_api_key'
+ALPACA_SECRET_KEY = 'your_alpaca_secret_key'
+RAVENPACK_API_KEY = 'your_ravenpack_api_key'  # Assuming there's a way to authenticate with RavenPack
+
+# Set up APIs
+openai.api_key = OPENAI_API_KEY
+alpaca_api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, base_url='https://paper-api.alpaca.markets')
+
+# Global Variables
+news_scores = pd.DataFrame(columns=['timestamp', 'symbol', 'score', 'trade_action', 'close_time'])
+
+# Function to fetch news from RavenPack
+def fetch_news_from_ravenpack():
+    try:
+        headers = {'Authorization': f'Bearer {RAVENPACK_API_KEY}'}
+        response = requests.get('https://api.ravenpack.com/v1/news', headers=headers)
+        if response.status_code == 200:
+            news_items = response.json()['data']
+            return news_items
+        else:
+            logging.error("Failed to fetch news from RavenPack: HTTP Status Code {}".format(response.status_code))
+            return []
+    except Exception as e:
+        logging.error("Exception occurred when fetching news from RavenPack: {}".format(e))
+        return []
+
+
+# Analyze sentiment with ChatGPT
+def analyze_sentiment_with_chatgpt(headline):
+    prompt = f"""Forget all your previous instructions. Pretend you are a financial expert. You are
+a financial expert with stock recommendation experience. Answer "YES" if good
+news, "NO" if bad news, or "UNKNOWN" if uncertain in the first line. Then
+elaborate with one short and concise sentence on the next line. Is this headline
+good or bad for the stock price of the company in the short term?
+Headline: {headline}"""
+
+        response = openai.Completion.create(engine="text-davinci-003", prompt=prompt, max_tokens=60)
+        analysis = response.choices[0].text.strip().split('\n')[0]
+        return 1 if analysis == "YES" else -1 if analysis == "NO" else 0
+    except Exception as e:
+        logging.error("Exception occurred when analyzing sentiment: {}".format(e))
+        return 0
+
+def average_sentiment_scores():
+    global news_scores
+    if not news_scores.empty:
+        # Convert timestamp to date for grouping
+        news_scores['date'] = pd.to_datetime(news_scores['timestamp']).dt.date
+        # Average scores by symbol and date
+        avg_scores = news_scores.groupby(['symbol', 'date'])['score'].mean().reset_index()
+        # Update global variable or handle the averaged scores as needed
+        news_scores = avg_scores
+
+
+# Time-sensitive trading logic
+def determine_trade_window(timestamp):
+    trade_time = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).astimezone(tz=None)
+    if trade_time.hour < 6:
+        return 'market_open'
+    elif 6 <= trade_time.hour < 16:
+        return 'same_day_close'
+    else:
+        return 'next_day_open'
+
+def execute_trade(symbol, qty, side):
+    """
+    Execute a trade order using the Alpaca API.
+    """
+    try:
+        order = alpaca_api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type='market',
+            time_in_force='gtc'  # good till cancel
+        )
+        print(f"Order executed: {order.side} {order.qty} shares of {order.symbol}")
+    except Exception as e:
+        logging.error(f"Failed to execute trade for {symbol}: {e}")
+
+
+
+
+# Make trading decisions based on sentiment score
+def trade_based_on_sentiment(symbol, score, timestamp):
+    global news_scores
+    trade_time = datetime.strptime(timestamp, '%Y-%m-%dT%H:%M:%SZ').replace(tzinfo=timezone.utc).astimezone(tz=None)
+    qty = '10'  # Adjust based on strategy
+    side = 'buy' if score > 0 else 'sell'
+
+    # Determine the trading window and close time based on news timestamp
+    if trade_time.hour < 6:
+        # Pre-market headlines
+        trade_action = 'market_open'
+        close_time = trade_time.replace(hour=16, minute=0)  # Same day close
+    elif 6 <= trade_time.hour < 16:
+        # Intraday headlines
+        trade_action = 'same_day_close'
+        close_time = trade_time + pd.Timedelta(days=1)
+        close_time = close_time.replace(hour=16, minute=0)  # Next day close
+    else:
+        # After-hours headlines
+        trade_action = 'next_day_open'
+        close_time = trade_time + pd.Timedelta(days=1)
+        close_time = close_time.replace(hour=16, minute=0)  # Next day close
+
+    news_scores = news_scores.append({
+        'timestamp': timestamp,
+        'symbol': symbol,
+        'score': score,
+        'trade_action': trade_action,
+        'close_time': close_time.strftime('%Y-%m-%d %H:%M:%S')
+    }, ignore_index=True)
+
+
+
+# Record and analyze data
+def record_and_analyze_data():
+    global news_scores
+    # Example linear regression on news_scores data
+    # This is a placeholder; implement according to your regression model needs
+    if not news_scores.empty:
+        X = news_scores[['score']]  # Predictor variable
+        y = np.random.rand(len(news_scores), 1)  # Mock response variable, replace with actual stock returns
+        model = LinearRegression().fit(X, y)
+        print("Regression model fit:", model.score(X, y))
+
+
+def manage_positions():
+    try:
+        market_status = alpaca_api.get_clock()
+        if not market_status.is_open:
+            print("Market is closed, skipping position management.")
+            return
+
+        current_time = datetime.now(timezone.utc)
+        for index, row in news_scores.iterrows():
+            symbol = row['symbol']
+            close_time = row['close_time']
+            close_time = datetime.strptime(row['close_time'], '%Y-%m-%d %H:%M:%S')
+            if current_time >= close_time:  # It's time to close the position
+                # Determine the quantity to sell based on the position size
+                try:
+                    position = alpaca_api.get_position(symbol)
+                    qty = abs(int(position.qty))  # Assumes position exists; handle exceptions as needed
+                    if int(position.qty) > 0:  # Close long positions
+                        order = alpaca_api.submit_order(symbol, qty, 'sell', 'market', 'day')
+                    else:  # Close short positions, if applicable
+                        order = alpaca_api.submit_order(symbol, qty, 'buy', 'market', 'day')
+                    print(f"Position closed for {symbol}: {order.qty} shares")
+                except Exception as e:
+                    print(f"Error managing position for {symbol}: {e}")
+    except Exception as e:
+        logging.error(f"Error managing positions: {e}")
+
+
+def run_trading_model():
+    global news_scores
+    while True:
+        news_items = fetch_news_from_ravenpack()
+        for item in news_items:
+            timestamp = item['timestamp']
+            headline = item['title']
+            symbol = item['ticker']
+            score = analyze_sentiment_with_chatgpt(headline)
+            # Determine trade action and close time based on timestamp
+            trade_based_on_sentiment(symbol, score, timestamp)
+
+        average_sentiment_scores()
+        manage_positions()
+        record_and_analyze_data()
+        # Wait before the next cycle
+        time.sleep(3600)
+
+if __name__ == "__main__":
+    run_trading_model()
